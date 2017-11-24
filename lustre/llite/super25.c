@@ -42,6 +42,7 @@
 #include <lprocfs_status.h>
 #include "llite_internal.h"
 #include "vvp_internal.h"
+#include "fs_cache.h"
 
 static struct kmem_cache *ll_inode_cachep;
 
@@ -158,6 +159,10 @@ static int __init lustre_init(void)
 	lustre_register_client_fill_super(ll_fill_super);
 	lustre_register_kill_super_cb(ll_kill_super);
 
+	rc = fscache_register_netfs(&lustre_cache_netfs);
+	if (rc)
+		printk(KERN_ERR "init fscache failed: %d\n", rc);
+
 	RETURN(0);
 
 out_inode_fini_env:
@@ -183,6 +188,7 @@ static void __exit lustre_exit(void)
 	cl_env_put(cl_inode_fini_env, &cl_inode_fini_refcheck);
 	vvp_global_fini();
 
+	fscache_unregister_netfs(&lustre_cache_netfs);
 	kmem_cache_destroy(ll_inode_cachep);
 	kmem_cache_destroy(ll_file_data_slab);
 }
