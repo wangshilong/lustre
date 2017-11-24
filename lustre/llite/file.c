@@ -52,6 +52,7 @@
 #include "cl_object.h"
 #include "llite_internal.h"
 #include "vvp_internal.h"
+#include "fs_cache.h"
 
 struct split_param {
 	struct inode	*sp_inode;
@@ -800,6 +801,7 @@ restart:
 	mutex_unlock(&lli->lli_och_mutex);
         fd = NULL;
 
+	lustre_fscache_open_file(inode, file);
         /* Must do this outside lli_och_mutex lock to prevent deadlock where
            different kind of OPEN lock for this same inode gets cancelled
            by ldlm_cancel_lru */

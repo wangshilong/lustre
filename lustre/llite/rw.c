@@ -57,6 +57,7 @@
 #include <obd_cksum.h>
 #include "llite_internal.h"
 #include <lustre_compat.h>
+#include "fs_cache.h"
 
 #define RAS_CDEBUG(ras) CDEBUG(D_READA,					\
 	"lrp %lu nra %lu wz %lu cp %lu csr %lu sf %lu sp %lu sl %lu\n",	\
@@ -373,6 +374,10 @@ int ll_readpage(struct file *file, struct page *vmpage)
 	bool pio_enabled = !!(ll_i2sbi(inode)->ll_flags & LL_SBI_PIO);
 	int rc = 0;
 	ENTRY;
+
+	rc = lustre_readpage_from_fscache(inode, vmpage);
+	if (rc == 0)
+		return rc;
 
 	lcc = ll_cl_find(file);
 	if (lcc == NULL || lcc->lcc_io == NULL)

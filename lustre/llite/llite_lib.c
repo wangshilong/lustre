@@ -58,6 +58,7 @@
 #include <cl_object.h>
 #include <obd_cksum.h>
 #include "llite_internal.h"
+#include "fs_cache.h"
 
 struct kmem_cache *ll_file_data_slab;
 
@@ -136,6 +137,7 @@ static struct ll_sb_info *ll_init_sbi(void)
 	/* root squash */
 	sbi->ll_squash.rsi_uid = 0;
 	sbi->ll_squash.rsi_gid = 0;
+	sbi->fscache = NULL;
 	INIT_LIST_HEAD(&sbi->ll_squash.rsi_nosquash_nids);
 	init_rwsem(&sbi->ll_squash.rsi_sem);
 
@@ -933,6 +935,7 @@ void ll_lli_init(struct ll_inode_info *lli)
         lli->lli_open_fd_read_count = 0;
         lli->lli_open_fd_write_count = 0;
         lli->lli_open_fd_exec_count = 0;
+	//lli->fscache = NULL;
 	mutex_init(&lli->lli_och_mutex);
 	spin_lock_init(&lli->lli_agl_lock);
 	spin_lock_init(&lli->lli_layout_lock);
@@ -1032,6 +1035,8 @@ int ll_fill_super(struct super_block *sb, struct vfsmount *mnt)
 	lsi->lsi_llsbi = sbi = ll_init_sbi();
 	if (!sbi)
 		GOTO(out_free, err = -ENOMEM);
+
+	lustre_cache_session_get_cookie(sb);
 
 	err = ll_options(lsi->lsi_lmd->lmd_opts, sbi);
 	if (err)
@@ -1144,6 +1149,8 @@ void ll_put_super(struct super_block *sb)
 		GOTO(out_no_sbi, 0);
 
         CDEBUG(D_VFSTRACE, "VFS Op: sb %p - %s\n", sb, profilenm);
+
+	lustre_cache_session_put_cookie(sb);
 
         cfg.cfg_instance = sb;
         lustre_end_log(sb, profilenm, &cfg);
@@ -2094,6 +2101,11 @@ void ll_delete_inode(struct inode *inode)
 	LASSERTF(inode->i_data.nrpages == 0, "inode="DFID"(%p) nrpages=%lu, "
 		 "see https://jira.hpdd.intel.com/browse/LU-118\n",
 		 PFID(ll_inode2fid(inode)), inode, inode->i_data.nrpages);
+
+	if (!inode->i_nlink)
+		lustre_fscache_evict_inode(inode);
+	else
+		lustre_fscache_release_inode(inode);
 
 #ifdef HAVE_SBOPS_EVICT_INODE
 	ll_clear_inode(inode);
