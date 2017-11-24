@@ -56,6 +56,7 @@
 #include <obd_cksum.h>
 #include "llite_internal.h"
 #include <lustre_compat.h>
+#include "fs_cache.h"
 
 static void ll_ra_stats_inc_sbi(struct ll_sb_info *sbi, enum ra_stat which);
 
@@ -1077,7 +1078,8 @@ void ll_cl_remove(struct file *file, const struct lu_env *env)
 }
 
 static int ll_io_read_page(const struct lu_env *env, struct cl_io *io,
-			   struct cl_page *page, struct file *file)
+			   struct page *vmpage, struct cl_page *page,
+			   struct file *file)
 {
 	struct inode              *inode  = vvp_object_inode(page->cp_obj);
 	struct ll_sb_info         *sbi    = ll_i2sbi(inode);
@@ -1146,6 +1148,12 @@ int ll_readpage(struct file *file, struct page *vmpage)
 	struct cl_page *page;
 	int result;
 	ENTRY;
+
+	result = lustre_readpage_from_fscache(inode, vmpage);
+	if (result == 0) {
+		WARN_ON_ONCE(!PageUptodate(vmpage));
+		return result;
+	}
 
 	lcc = ll_cl_find(file);
 	if (lcc != NULL) {
@@ -1219,7 +1227,7 @@ int ll_readpage(struct file *file, struct page *vmpage)
 		LASSERT(page->cp_type == CPT_CACHEABLE);
 		if (likely(!PageUptodate(vmpage))) {
 			cl_page_assume(env, io, page);
-			result = ll_io_read_page(env, io, page, file);
+			result = ll_io_read_page(env, io, vmpage, page, file);
 		} else {
 			/* Page from a non-object file. */
 			unlock_page(vmpage);

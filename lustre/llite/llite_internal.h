@@ -233,6 +233,8 @@ struct ll_inode_info {
 	struct rw_semaphore		lli_xattrs_list_rwsem;
 	struct mutex			lli_xattrs_enq_lock;
 	struct list_head		lli_xattrs; /* ll_xattr_entry->xe_list */
+	/* for fs cache purpose */
+	struct fscache_cookie		*fscache;
 };
 
 static inline __u32 ll_layout_version_get(struct ll_inode_info *lli)
@@ -538,6 +540,9 @@ struct ll_sb_info {
 
 	/* st_blksize returned by stat(2), when non-zero */
 	unsigned int		  ll_stat_blksize;
+
+	/* for fs cache purpose */
+	struct fscache_cookie		*fscache;
 };
 
 /*

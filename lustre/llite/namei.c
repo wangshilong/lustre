@@ -48,6 +48,7 @@
 #include <lustre_fid.h>
 #include <lustre_dlm.h>
 #include "llite_internal.h"
+#include "fs_cache.h"
 
 static int ll_create_it(struct inode *dir, struct dentry *dentry,
 			struct lookup_intent *it,
@@ -136,6 +137,7 @@ struct inode *ll_iget(struct super_block *sb, ino_t hash,
 			inode = ERR_PTR(rc);
 		} else {
 			inode_has_no_xattr(inode);
+			lustre_fscache_init_inode(inode);
 			unlock_new_inode(inode);
 		}
 	} else if (is_bad_inode(inode)) {
@@ -834,6 +836,7 @@ static int ll_atomic_open(struct inode *dir, struct dentry *dentry,
 			} else {
 				file->private_data = it;
 				rc = finish_open(file, dentry, NULL, opened);
+				lustre_fscache_open_file(d_inode(dentry), file);
 				/* We dget in ll_splice_alias. finish_open takes
 				 * care of dget for fd open.
 				 */

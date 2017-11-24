@@ -47,6 +47,7 @@
 #include <libcfs/libcfs.h>
 #include "llite_internal.h"
 #include "vvp_internal.h"
+#include "fs_cache.h"
 
 /*****************************************************************************
  *
@@ -57,6 +58,7 @@
 static void vvp_page_fini_common(struct vvp_page *vpg)
 {
 	struct page *vmpage = vpg->vpg_page;
+
 
 	LASSERT(vmpage != NULL);
 	put_page(vmpage);
@@ -147,6 +149,7 @@ static void vvp_page_discard(const struct lu_env *env,
 	if (vpg->vpg_defer_uptodate && !vpg->vpg_ra_used)
 		ll_ra_stats_inc(vmpage->mapping->host, RA_STAT_DISCARDED);
 
+	lustre_fscache_invalidate_page(vmpage);
 	ll_invalidate_page(vmpage);
 }
 
@@ -272,6 +275,11 @@ static void vvp_page_completion_read(const struct lu_env *env,
 	} else {
 		vpg->vpg_defer_uptodate = 0;
 	}
+
+	if (ioret == 0)
+		lustre_readpage_to_fscache(inode, vmpage);
+	else
+		lustre_uncache_page(inode, vmpage);
 
 	if (page->cp_sync_io == NULL)
 		unlock_page(vmpage);

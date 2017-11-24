@@ -49,6 +49,7 @@
 
 #include "llite_internal.h"
 #include <lustre_compat.h>
+#include "fs_cache.h"
 
 static const struct vm_operations_struct ll_file_vm_ops;
 
@@ -408,6 +409,9 @@ static int ll_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
 			   LPROC_LL_MKWRITE, 1);
 
 	file_update_time(vma->vm_file);
+	/* make sure the cache has finished storing the page */
+	lustre_fscache_wait_on_page_write(file_inode(vma->vm_file),
+					  vmf->page);
         do {
                 retry = false;
                 result = ll_page_mkwrite0(vma, vmf->page, &retry);

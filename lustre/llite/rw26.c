@@ -60,6 +60,7 @@
 
 #include "llite_internal.h"
 #include <lustre_compat.h>
+#include "fs_cache.h"
 
 /**
  * Implements Linux VM address_space::invalidatepage() method. This method is
@@ -97,6 +98,7 @@ static void ll_invalidatepage(struct page *vmpage,
 #else
 	if (offset == 0) {
 #endif
+		lustre_fscache_invalidate_page(vmpage);
 		/* See the comment in ll_releasepage() */
 		env = cl_env_percpu_get();
 		LASSERT(!IS_ERR(env));
@@ -133,6 +135,7 @@ static int ll_releasepage(struct page *vmpage, RELEASEPAGE_ARG_TYPE gfp_mask)
 	if (PageWriteback(vmpage) || PageDirty(vmpage))
 		return 0;
 
+	lustre_fscache_release_page(vmpage, gfp_mask);
 	mapping = vmpage->mapping;
 	if (mapping == NULL)
 		return 1;
