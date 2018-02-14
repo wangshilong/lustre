@@ -34,6 +34,7 @@
 #define OSC_INTERNAL_H
 
 #define OAP_MAGIC 8675309
+#define LRU_ALLOC_TIMEOUT 1 /* 1 second */
 
 #include <libcfs/linux/linux-mem.h>
 #include <lustre_osc.h>

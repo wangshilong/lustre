@@ -99,7 +99,7 @@ static struct ll_sb_info *ll_init_sbi(void)
 	sbi->ll_ra_info.ra_max_pages_per_file = min(pages / 32,
 					   SBI_DEFAULT_READAHEAD_MAX);
 	sbi->ll_ra_info.ra_max_pages = sbi->ll_ra_info.ra_max_pages_per_file;
-	sbi->ll_ra_info.ra_max_read_ahead_whole_pages = -1;
+	sbi->ll_ra_info.ra_max_read_ahead_whole_pages = ULONG_MAX;
 
         ll_generate_random_uuid(uuid);
         class_uuid_unparse(uuid, &sbi->ll_sb_uuid);
@@ -478,7 +478,7 @@ static int client_common_fill_super(struct super_block *sb, char *md, char *dt,
 	sbi->ll_dt_exp->exp_connect_data = *data;
 
 	/* Don't change value if it was specified in the config log */
-	if (sbi->ll_ra_info.ra_max_read_ahead_whole_pages == -1)
+	if (sbi->ll_ra_info.ra_max_read_ahead_whole_pages == ULONG_MAX)
 		sbi->ll_ra_info.ra_max_read_ahead_whole_pages =
 			max_t(unsigned long, SBI_DEFAULT_READAHEAD_WHOLE_MAX,
 			      (data->ocd_brw_size >> PAGE_SHIFT));
@@ -1038,6 +1038,9 @@ int ll_fill_super(struct super_block *sb, struct vfsmount *mnt)
 	err = super_setup_bdi_name(sb, "lustre-%p", sb);
 	if (err)
 		GOTO(out_free, err);
+
+	/* tune readahead according to max_pages_per_file */
+	lsi->lsi_bdi.ra_pages = sbi->ll_ra_info.ra_max_pages_per_file;
 
 #ifndef HAVE_DCACHE_LOCK
 	/* kernel >= 2.6.38 store dentry operations in sb->s_d_op. */

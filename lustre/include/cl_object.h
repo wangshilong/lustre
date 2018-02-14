@@ -1465,17 +1465,17 @@ typedef void (*cl_commit_cbt)(const struct lu_env *, struct cl_io *,
 			      struct cl_page *);
 
 struct cl_read_ahead {
+	/* Release callback. If readahead holds resources underneath, this
+	 * function should be called to release it. */
+	void (*cra_release)(const struct lu_env *env, void *cbdata);
+	/* Callback data for cra_release routine */
+	void *cra_cbdata;
 	/* Maximum page index the readahead window will end.
 	 * This is determined DLM lock coverage, RPC and stripe boundary.
 	 * cra_end is included. */
 	pgoff_t cra_end;
 	/* optimal RPC size for this read, by pages */
-	unsigned long cra_rpc_size;
-	/* Release callback. If readahead holds resources underneath, this
-	 * function should be called to release it. */
-	void    (*cra_release)(const struct lu_env *env, void *cbdata);
-	/* Callback data for cra_release routine */
-	void	*cra_cbdata;
+	__u32 cra_rpc_size;
 };
 
 static inline void cl_read_ahead_release(const struct lu_env *env,

@@ -2675,6 +2675,24 @@ inode_ops_xattr, [
 ]) # LC_IOP_XATTR
 
 #
+# LC_READAHEAD_GFP_MASK
+#
+# Kernel version 4.8 commit 8a5c743e308dd2b90ad10d1faaa7a1b09173a132
+# use consistent gfp flags during readahead
+#
+AC_DEFUN([LC_READAHEAD_GFP_MASK], [
+LB_CHECK_COMPILE([if 'readahead_gfp_mask' is defined],
+readahead_gfp_mask, [
+	#include <linux/pagemap.h>
+],[
+	gfp_t gfp = readahead_gfp_mask(NULL);
+],[
+	AC_DEFINE(HAVE_READAHEAD_GFP_MASK, 1,
+		[readahead_gfp_mask is defined])
+])
+]) # LC_READAHEAD_GFP_MASK
+
+#
 # LC_GROUP_INFO_GID
 #
 # Kernel version 4.9 commit 81243eacfa400f5f7b89f4c2323d0de9982bb0fb
@@ -3127,6 +3145,7 @@ AC_DEFUN([LC_PROG_LINUX], [
 	LC_FULL_NAME_HASH_3ARGS
 	LC_STRUCT_POSIX_ACL_XATTR
 	LC_IOP_XATTR
+	LC_READAHEAD_GFP_MASK
 
 	# 4.9
 	LC_GROUP_INFO_GID

@@ -259,12 +259,30 @@ static int vvp_io_one_lock(const struct lu_env *env, struct cl_io *io,
 				     cl_index(obj, start), cl_index(obj, end));
 }
 
+static int vvp_io_read_iter_init(const struct lu_env *env,
+				 const struct cl_io_slice *ios)
+{
+	struct vvp_io *vio = cl2vvp_io(env, ios);
+
+	cl_page_list_init(&vio->u.read.vui_plist);
+
+	return 0;
+}
+
+static void vvp_io_read_iter_fini(const struct lu_env *env,
+				  const struct cl_io_slice *ios)
+{
+	struct vvp_io *vio = cl2vvp_io(env, ios);
+
+	LASSERT(vio->u.read.vui_plist.pl_nr == 0);
+}
+
 static int vvp_io_write_iter_init(const struct lu_env *env,
 				  const struct cl_io_slice *ios)
 {
 	struct vvp_io *vio = cl2vvp_io(env, ios);
 
-	cl_page_list_init(&vio->u.write.vui_queue);
+	cl_page_list_init(&vio->u.write.vui_plist);
 	vio->u.write.vui_written = 0;
 	vio->u.write.vui_from = 0;
 	vio->u.write.vui_to = PAGE_SIZE;
@@ -277,7 +295,7 @@ static void vvp_io_write_iter_fini(const struct lu_env *env,
 {
 	struct vvp_io *vio = cl2vvp_io(env, ios);
 
-	LASSERT(vio->u.write.vui_queue.pl_nr == 0);
+	LASSERT(vio->u.write.vui_plist.pl_nr == 0);
 }
 
 static int vvp_io_fault_iter_init(const struct lu_env *env,
@@ -304,9 +322,9 @@ static void vvp_io_fini(const struct lu_env *env, const struct cl_io_slice *ios)
 
 	CLOBINVRNT(env, obj, vvp_object_invariant(obj));
 
-	CDEBUG(D_VFSTRACE, DFID" ignore/verify layout %d/%d, layout version %d "
-	       "need write layout %d, restore needed %d\n",
-	       PFID(lu_object_fid(&obj->co_lu)),
+	CDEBUG(D_VFSTRACE, DFID" type %d, ignore/verify layout %d/%d, "
+	       "layout version %d need write layout %d, restore needed %d\n",
+	       PFID(lu_object_fid(&obj->co_lu)), io->ci_type,
 	       io->ci_ignore_layout, io->ci_verify_layout,
 	       vio->vui_layout_gen, io->ci_need_write_intent,
 	       io->ci_restore_needed);
@@ -752,6 +770,79 @@ static void vvp_io_setattr_fini(const struct lu_env *env,
 	}
 }
 
+int vvp_io_read_commit(const struct lu_env *env, struct cl_io *io,
+		       struct cl_page_list *plist)
+{
+	struct cl_sync_io *anchor = &vvp_env_info(env)->vti_anchor;
+	struct cl_2queue *queue = &io->ci_queue;
+	struct cl_page *page, *tmp;
+	int nr_sync = 0;
+	int rc = 0;
+	ENTRY;
+
+	if (plist->pl_nr == 0)
+		RETURN(0);
+
+	CDEBUG(D_VFSTRACE, "commit pages: %u\n", plist->pl_nr);
+
+	cl_page_list_for_each(page, plist) {
+		if (page->cp_sync_io == NULL) {
+			page->cp_sync_io = anchor;
+			nr_sync++;
+		}
+	}
+	cl_sync_io_init(anchor, nr_sync, &cl_sync_io_end);
+
+	cl_2queue_init(queue);
+	cl_page_list_splice(plist, &queue->c2_qin);
+	cl_page_list_init(plist);
+
+	rc = cl_io_submit_rw(env, io, CRT_READ, queue);
+	if (!rc) {
+		cl_page_list_for_each(page, &queue->c2_qin) {
+			if (page->cp_sync_io == anchor) {
+				page->cp_sync_io = NULL;
+				cl_sync_io_note(env, anchor, 0);
+			}
+		}
+
+		/* wait for the IO to be finished */
+		rc = cl_sync_io_wait(env, anchor, 0);
+
+		cl_page_list_for_each_safe(page, tmp, &queue->c2_qout) {
+			cl_page_assume(env, io, page);
+			cl_page_list_del(env, &queue->c2_qout, page);
+
+			if (!PageUptodate(cl_page_vmpage(page))) {
+				/* Failed to read a mirror,
+				 * discard this page so that new page
+				 * can be created with new mirror.
+				 *
+				 * TODO:
+				 * this is not needed after page reinit
+				 * route is implemented */
+				cl_page_discard(env, io, page);
+			}
+			cl_page_disown(env, io, page);
+			cl_page_put(env, page);
+		}
+	}
+
+	/* TODO:
+	 * discard all pages until page reinit route is implemented */
+	cl_page_list_for_each(page, &queue->c2_qin) {
+		if (page->cp_sync_io == anchor)
+			page->cp_sync_io = NULL;
+		cl_page_discard(env, io, page);
+		cl_page_disown(env, io, page);
+		cl_page_put(env, page);
+	}
+
+	cl_2queue_fini(env, queue);
+
+	RETURN(rc);
+}
+
 static int vvp_io_read_start(const struct lu_env *env,
 			     const struct cl_io_slice *ios)
 {
@@ -763,7 +854,6 @@ static int vvp_io_read_start(const struct lu_env *env,
 	struct file		*file  = vio->vui_fd->fd_file;
 	struct cl_io_range	*range = &io->u.ci_rw.rw_range;
 	loff_t pos = range->cir_pos; /* for generic_file_splice_read() only */
-	size_t tot = vio->vui_tot_count;
 	int exceed = 0;
 	int result;
 	ENTRY;
@@ -790,20 +880,9 @@ static int vvp_io_read_start(const struct lu_env *env,
 		GOTO(out, result);
 
 	LU_OBJECT_HEADER(D_INODE, env, &obj->co_lu,
-			 "Read ino %lu, %lu bytes, offset %lld, size %llu\n",
+			 "Read ino %lu, %zu bytes, offset %llu, size %llu\n",
 			 inode->i_ino, range->cir_count, range->cir_pos,
 			 i_size_read(inode));
-
-	/* turn off the kernel's read-ahead */
-	vio->vui_fd->fd_file->f_ra.ra_pages = 0;
-
-	/* initialize read-ahead window once per syscall */
-	if (!vio->vui_ra_valid) {
-		vio->vui_ra_valid = true;
-		vio->vui_ra_start = cl_index(obj, range->cir_pos);
-		vio->vui_ra_count = cl_index(obj, tot + PAGE_SIZE - 1);
-		ll_ras_enter(file);
-	}
 
 	/* BUG: 5972 */
 	file_accessed(file);
@@ -818,9 +897,9 @@ static int vvp_io_read_start(const struct lu_env *env,
 		break;
 	case IO_SPLICE:
 		result = generic_file_splice_read(file, &pos,
-						  vio->u.splice.vui_pipe,
+						  vio->u.read.vui_splice_pipe,
 						  range->cir_count,
-						  vio->u.splice.vui_flags);
+						  vio->u.read.vui_splice_flags);
 		/* LU-1109: do splice read stripe by stripe otherwise if it
 		 * may make nfsd stuck if this read occupied all internal pipe
 		 * buffers. */
@@ -946,50 +1025,50 @@ int vvp_io_write_commit(const struct lu_env *env, struct cl_io *io)
 	struct cl_object *obj = io->ci_obj;
 	struct inode *inode = vvp_object_inode(obj);
 	struct vvp_io *vio = vvp_env_io(env);
-	struct cl_page_list *queue = &vio->u.write.vui_queue;
+	struct cl_page_list *plist = &vio->u.write.vui_plist;
 	struct cl_page *page;
 	int rc = 0;
-	int bytes = 0;
-	unsigned int npages = vio->u.write.vui_queue.pl_nr;
+	ssize_t bytes = 0;
+	unsigned int npages = plist->pl_nr;
 	ENTRY;
 
 	if (npages == 0)
 		RETURN(0);
 
-	CDEBUG(D_VFSTRACE, "commit async pages: %d, from %d, to %d\n",
+	CDEBUG(D_VFSTRACE, "commit async pages: %u, from %d, to %d\n",
 		npages, vio->u.write.vui_from, vio->u.write.vui_to);
 
-	LASSERT(page_list_sanity_check(obj, queue));
+	LASSERT(page_list_sanity_check(obj, plist));
 
 	/* submit IO with async write */
-	rc = cl_io_commit_async(env, io, queue,
+	rc = cl_io_commit_async(env, io, plist,
 				vio->u.write.vui_from, vio->u.write.vui_to,
 				write_commit_callback);
-	npages -= queue->pl_nr; /* already committed pages */
+	npages -= plist->pl_nr; /* already committed pages */
 	if (npages > 0) {
 		/* calculate how many bytes were written */
 		bytes = npages << PAGE_SHIFT;
 
 		/* first page */
 		bytes -= vio->u.write.vui_from;
-		if (queue->pl_nr == 0) /* last page */
+		if (plist->pl_nr == 0) /* last page */
 			bytes -= PAGE_SIZE - vio->u.write.vui_to;
-		LASSERTF(bytes > 0, "bytes = %d, pages = %d\n", bytes, npages);
+		LASSERTF(bytes > 0, "bytes = %zd, pages = %d\n", bytes, npages);
 
 		vio->u.write.vui_written += bytes;
 
-		CDEBUG(D_VFSTRACE, "Committed %d pages %d bytes, tot: %ld\n",
+		CDEBUG(D_VFSTRACE, "Committed %d pages %zd bytes, tot: %zu\n",
 			npages, bytes, vio->u.write.vui_written);
 
 		/* the first page must have been written. */
 		vio->u.write.vui_from = 0;
 	}
-	LASSERT(page_list_sanity_check(obj, queue));
-	LASSERT(ergo(rc == 0, queue->pl_nr == 0));
+	LASSERT(page_list_sanity_check(obj, plist));
+	LASSERT(ergo(rc == 0, plist->pl_nr == 0));
 
 	/* out of quota, try sync write */
 	if (rc == -EDQUOT && !cl_io_is_mkwrite(io)) {
-		rc = vvp_io_commit_sync(env, io, queue,
+		rc = vvp_io_commit_sync(env, io, plist,
 					vio->u.write.vui_from,
 					vio->u.write.vui_to);
 		if (rc > 0) {
@@ -1003,9 +1082,9 @@ int vvp_io_write_commit(const struct lu_env *env, struct cl_io *io)
 
 	/* Now the pages in queue were failed to commit, discard them
 	 * unless they were dirtied before. */
-	while (queue->pl_nr > 0) {
-		page = cl_page_list_first(queue);
-		cl_page_list_del(env, queue, page);
+	while (plist->pl_nr > 0) {
+		page = cl_page_list_first(plist);
+		cl_page_list_del(env, plist, page);
 
 		if (!PageDirty(cl_page_vmpage(page)))
 			cl_page_discard(env, io, page);
@@ -1015,7 +1094,7 @@ int vvp_io_write_commit(const struct lu_env *env, struct cl_io *io)
 		lu_ref_del(&page->cp_reference, "cl_io", io);
 		cl_page_put(env, page);
 	}
-	cl_page_list_fini(env, queue);
+	cl_page_list_fini(env, plist);
 
 	RETURN(rc);
 }
@@ -1392,6 +1471,8 @@ static const struct cl_io_operations vvp_io_ops = {
 	.op = {
 		[CIT_READ] = {
 			.cio_fini	= vvp_io_fini,
+			.cio_iter_init	= vvp_io_read_iter_init,
+			.cio_iter_fini	= vvp_io_read_iter_fini,
 			.cio_lock	= vvp_io_read_lock,
 			.cio_start	= vvp_io_read_start,
 			.cio_end	= vvp_io_rw_end,
@@ -1447,15 +1528,8 @@ int vvp_io_init(const struct lu_env *env, struct cl_object *obj,
 	CLOBINVRNT(env, obj, vvp_object_invariant(obj));
 	ENTRY;
 
-	CDEBUG(D_VFSTRACE, DFID" ignore/verify layout %d/%d, layout version %d "
-	       "restore needed %d\n",
-	       PFID(lu_object_fid(&obj->co_lu)),
-	       io->ci_ignore_layout, io->ci_verify_layout,
-	       vio->vui_layout_gen, io->ci_restore_needed);
-
 	CL_IO_SLICE_CLEAN(vio, vui_cl);
 	cl_io_slice_add(io, &vio->vui_cl, obj, &vvp_io_ops);
-	vio->vui_ra_valid = false;
 	result = 0;
 	if (io->ci_type == CIT_READ || io->ci_type == CIT_WRITE) {
 		struct ll_inode_info *lli = ll_i2info(inode);
@@ -1494,6 +1568,12 @@ int vvp_io_init(const struct lu_env *env, struct cl_object *obj,
 				ll_get_fsname(inode->i_sb, NULL, 0),
 				PFID(lu_object_fid(&obj->co_lu)), result);
 	}
+
+	CDEBUG(D_VFSTRACE, DFID" type %d, ignore/verify layout %d/%d, "
+	       "layout version %d restore needed %d\n",
+	       PFID(lu_object_fid(&obj->co_lu)), io->ci_type,
+	       io->ci_ignore_layout, io->ci_verify_layout,
+	       vio->vui_layout_gen, io->ci_restore_needed);
 
 	io->ci_result = result < 0 ? result : 0;
 	RETURN(result);

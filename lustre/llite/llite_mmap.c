@@ -282,7 +282,7 @@ static int ll_fault0(struct vm_area_struct *vma, struct vm_fault *vmf)
 
 	if (ll_sbi_has_fast_read(ll_i2sbi(file_inode(vma->vm_file)))) {
 		/* do fast fault */
-		ll_cl_add(vma->vm_file, env, NULL, LCC_MMAP);
+		ll_cl_add(vma->vm_file, env, NULL);
 		fault_ret = ll_filemap_fault(vma, vmf);
 		ll_cl_remove(vma->vm_file, env);
 
@@ -312,7 +312,7 @@ static int ll_fault0(struct vm_area_struct *vma, struct vm_fault *vmf)
 		vio->u.fault.ft_flags_valid = 0;
 
 		/* May call ll_readpage() */
-		ll_cl_add(vma->vm_file, env, io, LCC_MMAP);
+		ll_cl_add(vma->vm_file, env, io);
 
 		result = cl_io_loop(env, io);
 
