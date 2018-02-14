@@ -581,22 +581,28 @@ out:
  * the caller.
  */
 static int ll_prepare_partial_page(const struct lu_env *env, struct cl_io *io,
-				   struct cl_page *pg, struct file *file)
+				   struct cl_page *page, struct file *file)
 {
-	struct cl_attr *attr   = vvp_env_thread_attr(env);
-	struct cl_object *obj  = io->ci_obj;
-	struct vvp_page *vpg   = cl_object_page_slice(obj, pg);
-	loff_t          offset = cl_offset(obj, vvp_index(vpg));
-	int             result;
+	struct cl_object *obj = io->ci_obj;
+	struct cl_attr *attr = vvp_env_thread_attr(env);
+	struct cl_2queue *queue = &io->ci_queue;
+	struct cl_sync_io *anchor = &vvp_env_info(env)->vti_anchor;
+	struct cl_io_range *range = &io->u.ci_rw.rw_range;
+	struct address_space *mapping = file->f_mapping;
+	struct file_ra_state *ra = &file->f_ra;
+	struct page *vmpage = cl_page_vmpage(page);
+	pgoff_t index = vmpage->index;
+	pgoff_t last_index = (range->cir_pos + range->cir_count +
+			      PAGE_SIZE - 1) >> PAGE_SHIFT;
+	loff_t offset = cl_offset(obj, index);
+	int rc;
 	ENTRY;
 
 	cl_object_attr_lock(obj);
-	result = cl_object_attr_get(env, obj, attr);
+	rc = cl_object_attr_get(env, obj, attr);
 	cl_object_attr_unlock(obj);
-	if (result) {
-		cl_page_disown(env, io, pg);
-		GOTO(out, result);
-	}
+	if (rc)
+		GOTO(out, rc);
 
 	/*
 	 * If are writing to a new page, no need to read old data.
@@ -604,37 +610,59 @@ static int ll_prepare_partial_page(const struct lu_env *env, struct cl_io *io,
 	 * purposes here we can treat it like i_size.
 	 */
 	if (attr->cat_kms <= offset) {
-		char *kaddr = ll_kmap_atomic(vpg->vpg_page, KM_USER0);
+		char *kaddr = ll_kmap_atomic(vmpage, KM_USER0);
 
 		memset(kaddr, 0, cl_page_size(obj));
 		ll_kunmap_atomic(kaddr, KM_USER0);
-		GOTO(out, result = 0);
+		GOTO(out, rc = 0);
 	}
 
-	if (vpg->vpg_defer_uptodate) {
-		vpg->vpg_ra_used = 1;
-		GOTO(out, result = 0);
-	}
+	if (attr->cat_kms < cl_offset(obj, last_index))
+		last_index = attr->cat_kms >> PAGE_SHIFT;
 
-	result = ll_io_read_page(env, io, pg, file);
-	if (result)
-		GOTO(out, result);
+	page_cache_async_readahead(mapping, ra, file, vmpage,
+				   index, last_index - index);
 
-	/* ll_io_read_page() disowns the page */
-	result = cl_page_own(env, io, pg);
-	if (!result) {
-		if (!PageUptodate(cl_page_vmpage(pg))) {
-			cl_page_disown(env, io, pg);
-			result = -EIO;
+	if (unlikely(page->cp_sync_io != NULL))
+		GOTO(out, rc = -ENODATA);
+
+	cl_sync_io_init(anchor, 1, &cl_sync_io_end);
+	page->cp_sync_io = anchor;
+	cl_2queue_init(queue);
+	cl_2queue_add(queue, page);
+
+	rc = cl_io_submit_rw(env, io, CRT_READ, queue);
+
+	if (!cl_page_is_owned(page, io)) { /* have sent */
+		rc = cl_sync_io_wait(env, anchor, 0);
+
+		cl_page_assume(env, io, page);
+		cl_page_list_del(env, &queue->c2_qout, page);
+
+		if (!PageUptodate(cl_page_vmpage(page))) {
+			/* Failed to read a mirror, discard this page so that
+			 * new page can be created with new mirror.
+			 *
+			 * TODO: this is not needed after page reinit
+			 * route is implemented */
+			cl_page_discard(env, io, page);
+			rc = -EIO;
 		}
-	} else if (result == -ENOENT) {
-		/* page was truncated */
-		result = -EAGAIN;
 	}
-	EXIT;
 
+	if (page->cp_sync_io == anchor)
+		page->cp_sync_io = NULL;
+
+	/* TODO: discard all pages until page reinit route is implemented */
+	cl_page_list_discard(env, io, &queue->c2_qin);
+	/* Unlock unsent read pages in case of error. */
+	cl_page_list_disown(env, io, &queue->c2_qin);
+
+	cl_2queue_fini(env, queue);
 out:
-	return result;
+	if (rc)
+		cl_page_disown(env, io, page);
+	RETURN(rc);
 }
 
 static int ll_tiny_write_begin(struct page *vmpage)
@@ -648,20 +676,19 @@ static int ll_tiny_write_begin(struct page *vmpage)
 }
 
 static int ll_write_begin(struct file *file, struct address_space *mapping,
-			  loff_t pos, unsigned len, unsigned flags,
+			  loff_t pos, unsigned int len, unsigned int flags,
 			  struct page **pagep, void **fsdata)
 {
 	struct ll_cl_context *lcc = NULL;
 	const struct lu_env  *env = NULL;
 	struct cl_io   *io = NULL;
 	struct cl_page *page = NULL;
-
 	struct cl_object *clob = ll_i2info(mapping->host)->lli_clob;
 	pgoff_t index = pos >> PAGE_SHIFT;
 	struct page *vmpage = NULL;
-	unsigned from = pos & (PAGE_SIZE - 1);
-	unsigned to = from + len;
-	int result = 0;
+	unsigned int from = pos & (PAGE_SIZE - 1);
+	unsigned int to = from + len;
+	int rc = 0;
 	ENTRY;
 
 	CDEBUG(D_PAGE, "Writing %lu of %d to %d bytes\n", index, from, len);
@@ -669,8 +696,8 @@ static int ll_write_begin(struct file *file, struct address_space *mapping,
 	lcc = ll_cl_find(file);
 	if (lcc == NULL) {
 		vmpage = grab_cache_page_nowait(mapping, index);
-		result = ll_tiny_write_begin(vmpage);
-		GOTO(out, result);
+		rc = ll_tiny_write_begin(vmpage);
+		GOTO(out, rc);
 	}
 
 	env = lcc->lcc_env;
@@ -681,19 +708,17 @@ static int ll_write_begin(struct file *file, struct address_space *mapping,
 		 * this causes a problem for mirror write because the cached
 		 * page may belong to another mirror, which will result in
 		 * problem submitting the I/O. */
-		GOTO(out, result = -EBUSY);
+		GOTO(out, rc = -EBUSY);
 	}
 
-again:
 	/* To avoid deadlock, try to lock page first. */
 	vmpage = grab_cache_page_nowait(mapping, index);
-
 	if (unlikely(vmpage == NULL ||
 		     PageDirty(vmpage) || PageWriteback(vmpage))) {
 		struct vvp_io *vio = vvp_env_io(env);
-		struct cl_page_list *plist = &vio->u.write.vui_queue;
+		struct cl_page_list *plist = &vio->u.write.vui_plist;
 
-                /* if the page is already in dirty cache, we have to commit
+		/* if the page is already in dirty cache, we have to commit
 		 * the pages right now; otherwise, it may cause deadlock
 		 * because it holds page lock of a dirty page and request for
 		 * more grants. It's okay for the dirty page to be the first
@@ -705,21 +730,21 @@ again:
 		}
 
 		/* commit pages and then wait for page lock */
-		result = vvp_io_write_commit(env, io);
-		if (result < 0)
-			GOTO(out, result);
+		rc = vvp_io_write_commit(env, io);
+		if (rc < 0)
+			GOTO(out, rc);
 
 		if (vmpage == NULL) {
 			vmpage = grab_cache_page_write_begin(mapping, index,
 							     flags);
 			if (vmpage == NULL)
-				GOTO(out, result = -ENOMEM);
+				GOTO(out, rc = -ENOMEM);
 		}
 	}
 
 	page = cl_page_find(env, clob, vmpage->index, vmpage, CPT_CACHEABLE);
 	if (IS_ERR(page))
-		GOTO(out, result = PTR_ERR(page));
+		GOTO(out, rc = PTR_ERR(page));
 
 	lcc->lcc_page = page;
 	lu_ref_add(&page->cp_reference, "cl_io", io);
@@ -737,21 +762,14 @@ again:
 			/* TODO: can be optimized at OSC layer to check if it
 			 * is a lockless IO. In that case, it's not necessary
 			 * to read the data. */
-			result = ll_prepare_partial_page(env, io, page, file);
-			if (result) {
-				/* vmpage should have been unlocked */
-				put_page(vmpage);
-				vmpage = NULL;
-
-				if (result == -EAGAIN)
-					goto again;
-				GOTO(out, result);
-			}
+			rc = ll_prepare_partial_page(env, io, page, file);
+			if (rc)
+				GOTO(out, rc);
 		}
 	}
 	EXIT;
 out:
-	if (result < 0) {
+	if (rc < 0) {
 		if (vmpage != NULL) {
 			unlock_page(vmpage);
 			put_page(vmpage);
@@ -762,12 +780,12 @@ out:
 			cl_page_put(env, page);
 		}
 		if (io)
-			io->ci_result = result;
+			io->ci_result = rc;
 	} else {
 		*pagep = vmpage;
 		*fsdata = lcc;
 	}
-	RETURN(result);
+	RETURN(rc);
 }
 
 static int ll_tiny_write_end(struct file *file, struct address_space *mapping,
@@ -775,12 +793,11 @@ static int ll_tiny_write_end(struct file *file, struct address_space *mapping,
 			     struct page *vmpage)
 {
 	struct cl_page *clpage = (struct cl_page *) vmpage->private;
-	loff_t kms = pos+copied;
-	loff_t to = kms & (PAGE_SIZE-1) ? kms & (PAGE_SIZE-1) : PAGE_SIZE;
+	loff_t kms = pos + copied;
+	loff_t to = kms & (PAGE_SIZE - 1) ? kms & (PAGE_SIZE - 1) : PAGE_SIZE;
 	__u16 refcheck;
 	struct lu_env *env = cl_env_get(&refcheck);
 	int rc = 0;
-
 	ENTRY;
 
 	if (IS_ERR(env)) {
@@ -812,17 +829,16 @@ out:
 }
 
 static int ll_write_end(struct file *file, struct address_space *mapping,
-			loff_t pos, unsigned len, unsigned copied,
+			loff_t pos, unsigned int len, unsigned int copied,
 			struct page *vmpage, void *fsdata)
 {
 	struct ll_cl_context *lcc = fsdata;
 	const struct lu_env *env;
 	struct cl_io *io;
-	struct vvp_io *vio;
 	struct cl_page *page;
-	unsigned from = pos & (PAGE_SIZE - 1);
+	unsigned int from = pos & (PAGE_SIZE - 1);
 	bool unplug = false;
-	int result = 0;
+	int rc = 0;
 	ENTRY;
 
 	put_page(vmpage);
@@ -830,22 +846,19 @@ static int ll_write_end(struct file *file, struct address_space *mapping,
 	CDEBUG(D_VFSTRACE, "pos %llu, len %u, copied %u\n", pos, len, copied);
 
 	if (lcc == NULL) {
-		result = ll_tiny_write_end(file, mapping, pos, len, copied,
-					   vmpage);
-		GOTO(out, result);
+		rc = ll_tiny_write_end(file, mapping, pos, len, copied, vmpage);
+		GOTO(out, rc);
 	}
 
-	LASSERT(lcc != NULL);
 	env  = lcc->lcc_env;
-	page = lcc->lcc_page;
 	io   = lcc->lcc_io;
-	vio  = vvp_env_io(env);
+	page = lcc->lcc_page;
+	lcc->lcc_page = NULL;
 
 	LASSERT(cl_page_is_owned(page, io));
 	if (copied > 0) {
-		struct cl_page_list *plist = &vio->u.write.vui_queue;
-
-		lcc->lcc_page = NULL; /* page will be queued */
+		struct vvp_io *vio = vvp_env_io(env);
+		struct cl_page_list *plist = &vio->u.write.vui_plist;
 
 		/* Add it into write queue */
 		cl_page_list_add(plist, page);
@@ -869,7 +882,6 @@ static int ll_write_end(struct file *file, struct address_space *mapping,
 	} else {
 		cl_page_disown(env, io, page);
 
-		lcc->lcc_page = NULL;
 		lu_ref_del(&page->cp_reference, "cl_io", io);
 		cl_page_put(env, page);
 
@@ -877,14 +889,13 @@ static int ll_write_end(struct file *file, struct address_space *mapping,
 		unplug = true;
 	}
 	if (unplug || io->u.ci_rw.rw_sync)
-		result = vvp_io_write_commit(env, io);
+		rc = vvp_io_write_commit(env, io);
 
-	if (result < 0)
-		io->ci_result = result;
-
+	if (rc < 0)
+		io->ci_result = rc;
 
 out:
-	RETURN(result >= 0 ? copied : result);
+	RETURN(rc >= 0 ? copied : rc);
 }
 
 #ifdef CONFIG_MIGRATION
@@ -902,6 +913,7 @@ static int ll_migratepage(struct address_space *mapping,
 
 const struct address_space_operations ll_aops = {
 	.readpage	= ll_readpage,
+	.readpages	= ll_readpages,
 	.direct_IO	= ll_direct_IO,
 	.writepage	= ll_writepage,
 	.writepages	= ll_writepages,

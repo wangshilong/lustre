@@ -616,7 +616,7 @@ static int ll_local_open(struct file *file, struct lookup_intent *it,
 	}
 
 	LUSTRE_FPRIVATE(file) = fd;
-	ll_readahead_init(inode, &fd->fd_ras);
+	ll_ras_init(&fd->fd_ras);
 	fd->fd_omode = it->it_flags & (FMODE_READ | FMODE_WRITE | FMODE_EXEC);
 
 	/* ll_cl_context initialize */
@@ -1325,7 +1325,7 @@ static bool file_is_noatime(const struct file *file)
 
 static int ll_file_io_ptask(struct cfs_ptask *ptask);
 
-static void ll_io_init(struct cl_io *io, struct file *file, enum cl_io_type iot)
+void ll_io_init(struct cl_io *io, struct file *file, enum cl_io_type iot)
 {
 	struct inode *inode = file_inode(file);
 	struct ll_file_data *fd  = LUSTRE_FPRIVATE(file);
@@ -1398,7 +1398,7 @@ static int ll_file_io_ptask(struct cfs_ptask *ptask)
 		vio->vui_io_subtype = IO_NORMAL;
 		vio->vui_fd = LUSTRE_FPRIVATE(file);
 
-		ll_cl_add(file, env, io, LCC_RW);
+		ll_cl_add(file, env, io);
 		rc = cl_io_loop(env, io);
 		ll_cl_remove(file, env);
 	} else {
@@ -1500,15 +1500,15 @@ restart:
 			}
 			break;
 		case IO_SPLICE:
-			vio->u.splice.vui_pipe = args->u.splice.via_pipe;
-			vio->u.splice.vui_flags = args->u.splice.via_flags;
+			vio->u.read.vui_splice_pipe  = args->u.splice.via_pipe;
+			vio->u.read.vui_splice_flags = args->u.splice.via_flags;
 			break;
 		default:
 			CERROR("unknown IO subtype %u\n", vio->vui_io_subtype);
 			LBUG();
 		}
 
-		ll_cl_add(file, env, io, LCC_RW);
+		ll_cl_add(file, env, io);
 		if (io->ci_pio && iot == CIT_WRITE && !IS_NOSEC(inode) &&
 		    !lli->lli_inode_locked) {
 			inode_lock(inode);
@@ -1642,9 +1642,10 @@ out:
 static ssize_t
 ll_do_fast_read(struct kiocb *iocb, struct iov_iter *iter)
 {
+	struct ll_sb_info *sbi = ll_i2sbi(file_inode(iocb->ki_filp));
 	ssize_t result;
 
-	if (!ll_sbi_has_fast_read(ll_i2sbi(file_inode(iocb->ki_filp))))
+	if (!ll_sbi_has_fast_read(sbi))
 		return 0;
 
 	/* NB: we can't do direct IO for fast read because it will need a lock
@@ -1655,14 +1656,12 @@ ll_do_fast_read(struct kiocb *iocb, struct iov_iter *iter)
 	result = generic_file_read_iter(iocb, iter);
 
 	/* If the first page is not in cache, generic_file_aio_read() will be
-	 * returned with -ENODATA.
-	 * See corresponding code in ll_readpage(). */
+	 * returned with -ENODATA. See corresponding code in ll_readpage(). */
 	if (result == -ENODATA)
-		result = 0;
+		return 0;
 
 	if (result > 0)
-		ll_stats_ops_tally(ll_i2sbi(file_inode(iocb->ki_filp)),
-				LPROC_LL_READ_BYTES, result);
+		ll_stats_ops_tally(sbi, LPROC_LL_READ_BYTES, result);
 
 	return result;
 }
@@ -1672,11 +1671,22 @@ ll_do_fast_read(struct kiocb *iocb, struct iov_iter *iter)
  */
 static ssize_t ll_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
+	struct vvp_io_args args;
 	struct lu_env *env;
-	struct vvp_io_args *args;
+	pgoff_t index;
+	pgoff_t last_index;
+	ssize_t count = iov_iter_count(to);
 	ssize_t result;
 	ssize_t rc2;
 	__u16 refcheck;
+
+	index = iocb->ki_pos >> PAGE_SHIFT;
+	last_index = (iocb->ki_pos + count + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	CDEBUG(D_READA, "%s: read range: [%llu, %llu), pages=[%lu, %lu)\n",
+		file_dentry(iocb->ki_filp)->d_name.name,
+		iocb->ki_pos, iocb->ki_pos + count,
+		index, last_index);
+	ll_ras_update(iocb->ki_filp, index, last_index - index);
 
 	result = ll_do_fast_read(iocb, to);
 	if (result < 0 || iov_iter_count(to) == 0)
@@ -1686,11 +1696,11 @@ static ssize_t ll_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	if (IS_ERR(env))
 		return PTR_ERR(env);
 
-	args = ll_env_args(env, IO_NORMAL);
-	args->u.normal.via_iter = to;
-	args->u.normal.via_iocb = iocb;
+	args.via_io_subtype = IO_NORMAL;
+	args.u.normal.via_iter = to;
+	args.u.normal.via_iocb = iocb;
 
-	rc2 = ll_file_io_generic(env, args, iocb->ki_filp, CIT_READ,
+	rc2 = ll_file_io_generic(env, &args, iocb->ki_filp, CIT_READ,
 				 &iocb->ki_pos, iov_iter_count(to));
 	if (rc2 > 0)
 		result += rc2;
@@ -1759,7 +1769,7 @@ static ssize_t ll_do_tiny_write(struct kiocb *iocb, struct iov_iter *iter)
  */
 static ssize_t ll_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
-	struct vvp_io_args *args;
+	struct vvp_io_args args;
 	struct lu_env *env;
 	ssize_t rc_tiny = 0, rc_normal;
 	__u16 refcheck;
@@ -1785,12 +1795,12 @@ static ssize_t ll_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (IS_ERR(env))
 		return PTR_ERR(env);
 
-	args = ll_env_args(env, IO_NORMAL);
-	args->u.normal.via_iter = from;
-	args->u.normal.via_iocb = iocb;
+	args.via_io_subtype = IO_NORMAL;
+	args.u.normal.via_iter = from;
+	args.u.normal.via_iocb = iocb;
 
-	rc_normal = ll_file_io_generic(env, args, iocb->ki_filp, CIT_WRITE,
-				    &iocb->ki_pos, iov_iter_count(from));
+	rc_normal = ll_file_io_generic(env, &args, iocb->ki_filp, CIT_WRITE,
+					&iocb->ki_pos, iov_iter_count(from));
 
 	/* On success, combine bytes written. */
 	if (rc_tiny >= 0 && rc_normal > 0)
@@ -1942,23 +1952,23 @@ static ssize_t ll_file_splice_read(struct file *in_file, loff_t *ppos,
                                    struct pipe_inode_info *pipe, size_t count,
                                    unsigned int flags)
 {
-        struct lu_env      *env;
-        struct vvp_io_args *args;
-        ssize_t             result;
-	__u16               refcheck;
-        ENTRY;
+	struct vvp_io_args args;
+	struct lu_env *env;
+	ssize_t result;
+	__u16 refcheck;
+	ENTRY;
 
-        env = cl_env_get(&refcheck);
-        if (IS_ERR(env))
-                RETURN(PTR_ERR(env));
+	env = cl_env_get(&refcheck);
+	if (IS_ERR(env))
+		RETURN(PTR_ERR(env));
 
-	args = ll_env_args(env, IO_SPLICE);
-        args->u.splice.via_pipe = pipe;
-        args->u.splice.via_flags = flags;
+	args.via_io_subtype = IO_SPLICE;
+	args.u.splice.via_pipe = pipe;
+	args.u.splice.via_flags = flags;
 
-        result = ll_file_io_generic(env, args, in_file, CIT_READ, ppos, count);
-        cl_env_put(env, &refcheck);
-        RETURN(result);
+	result = ll_file_io_generic(env, &args, in_file, CIT_READ, ppos, count);
+	cl_env_put(env, &refcheck);
+	RETURN(result);
 }
 
 int ll_lov_setstripe_ea_info(struct inode *inode, struct dentry *dentry,

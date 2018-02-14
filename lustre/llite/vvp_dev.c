@@ -37,6 +37,7 @@
 
 #define DEBUG_SUBSYSTEM S_LLITE
 
+#include <libcfs/libcfs_ptask.h>
 #include <obd.h>
 #include "llite_internal.h"
 #include "vvp_internal.h"
@@ -265,6 +266,8 @@ struct lu_device_type vvp_device_type = {
         .ldt_ctx_tags = LCT_CL_THREAD
 };
 
+struct cfs_ptask_engine *vvp_ra_engine;
+
 /**
  * A mutex serializing calls to vvp_inode_fini() under extreme memory
  * pressure, when environments cannot be allocated.
@@ -281,8 +284,17 @@ int vvp_global_init(void)
 	if (rc != 0)
 		goto out_kmem;
 
+	vvp_ra_engine = cfs_ptengine_init("read_ahead", cpu_online_mask);
+	if (IS_ERR(vvp_ra_engine)) {
+		rc = PTR_ERR(vvp_ra_engine);
+		vvp_ra_engine = NULL;
+		goto out_fini;
+	}
+
 	return 0;
 
+out_fini:
+	lu_device_type_fini(&vvp_device_type);
 out_kmem:
 	lu_kmem_fini(vvp_caches);
 
@@ -291,6 +303,8 @@ out_kmem:
 
 void vvp_global_fini(void)
 {
+	cfs_ptengine_fini(vvp_ra_engine);
+	vvp_ra_engine = NULL;
 	lu_device_type_fini(&vvp_device_type);
 	lu_kmem_fini(vvp_caches);
 }
@@ -504,11 +518,10 @@ static void vvp_pgcache_page_show(const struct lu_env *env,
 
 	vpg = cl2vvp_page(cl_page_at(page, &vvp_device_type));
 	vmpage = vpg->vpg_page;
-	seq_printf(seq, " %5i | %p %p %s %s %s | %p "DFID"(%p) %lu %u [",
+	seq_printf(seq, " %5i | %p %p %s %s | %p "DFID"(%p) %lu %u [",
 		   0 /* gen */,
 		   vpg, page,
 		   "none",
-		   vpg->vpg_defer_uptodate ? "du" : "- ",
 		   PageWriteback(vmpage) ? "wb" : "-",
 		   vmpage,
 		   PFID(ll_inode2fid(vmpage->mapping->host)),

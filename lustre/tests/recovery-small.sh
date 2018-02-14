@@ -392,13 +392,13 @@ test_15() {
 }
 run_test 15 "failed open (-ENOMEM)"
 
-READ_AHEAD=`lctl get_param -n llite.*.max_read_ahead_mb | head -n 1`
+READ_AHEAD=$(lctl get_param -n llite.*.max_read_ahead_per_file_mb | head -n 1)
 stop_read_ahead() {
-   lctl set_param -n llite.*.max_read_ahead_mb 0
+	lctl set_param -n llite.*.max_read_ahead_per_file_mb=0
 }
 
 start_read_ahead() {
-   lctl set_param -n llite.*.max_read_ahead_mb $READ_AHEAD
+	lctl set_param -n llite.*.max_read_ahead_per_file_mb=$READ_AHEAD
 }
 
 test_16() {

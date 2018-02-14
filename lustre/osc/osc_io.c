@@ -71,9 +71,9 @@ static int osc_io_read_ahead(const struct lu_env *env,
 			     const struct cl_io_slice *ios,
 			     pgoff_t start, struct cl_read_ahead *ra)
 {
-	struct osc_object	*osc = cl2osc(ios->cis_obj);
-	struct ldlm_lock	*dlmlock;
-	int			result = -ENODATA;
+	struct osc_object *osc = cl2osc(ios->cis_obj);
+	struct ldlm_lock *dlmlock;
+	int result = -ENODATA;
 	ENTRY;
 
 	dlmlock = osc_dlmlock_at_pgoff(env, osc, start, 0);
@@ -88,7 +88,7 @@ static int osc_io_read_ahead(const struct lu_env *env,
 
 		ra->cra_rpc_size = osc_cli(osc)->cl_max_pages_per_rpc;
 		ra->cra_end = cl_index(osc2cl(osc),
-				       dlmlock->l_policy_data.l_extent.end);
+					dlmlock->l_policy_data.l_extent.end);
 		ra->cra_release = osc_read_ahead_release;
 		ra->cra_cbdata = dlmlock;
 		result = 0;

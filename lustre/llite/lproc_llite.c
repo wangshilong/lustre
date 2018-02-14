@@ -375,6 +375,7 @@ ll_max_readahead_per_file_mb_seq_write(struct file *file,
 	struct seq_file *m = file->private_data;
 	struct super_block *sb = m->private;
 	struct ll_sb_info *sbi = ll_s2sbi(sb);
+	struct lustre_sb_info *lsi = s2lsi(sb);
 	int rc;
 	__s64 pages_number;
 
@@ -394,6 +395,7 @@ ll_max_readahead_per_file_mb_seq_write(struct file *file,
 
 	spin_lock(&sbi->ll_lock);
 	sbi->ll_ra_info.ra_max_pages_per_file = pages_number;
+	lsi->lsi_bdi.ra_pages = pages_number;
 	spin_unlock(&sbi->ll_lock);
 	return count;
 }
@@ -1324,22 +1326,6 @@ void ll_stats_ops_tally(struct ll_sb_info *sbi, int op, int count)
 }
 EXPORT_SYMBOL(ll_stats_ops_tally);
 
-static const char *ra_stat_string[] = {
-	[RA_STAT_HIT] = "hits",
-	[RA_STAT_MISS] = "misses",
-	[RA_STAT_DISTANT_READPAGE] = "readpage not consecutive",
-	[RA_STAT_MISS_IN_WINDOW] = "miss inside window",
-	[RA_STAT_FAILED_GRAB_PAGE] = "failed grab_cache_page",
-	[RA_STAT_FAILED_MATCH] = "failed lock match",
-	[RA_STAT_DISCARDED] = "read but discarded",
-	[RA_STAT_ZERO_LEN] = "zero length file",
-	[RA_STAT_ZERO_WINDOW] = "zero size window",
-	[RA_STAT_EOF] = "read-ahead to EOF",
-	[RA_STAT_MAX_IN_FLIGHT] = "hit max r-a issue",
-	[RA_STAT_WRONG_GRAB_PAGE] = "wrong page from grab_cache_page",
-	[RA_STAT_FAILED_REACH_END] = "failed to reach end"
-};
-
 LPROC_SEQ_FOPS_RO_TYPE(llite, name);
 LPROC_SEQ_FOPS_RO_TYPE(llite, uuid);
 
@@ -1410,22 +1396,9 @@ int ll_debugfs_register_super(struct super_block *sb, const char *name)
 	if (err)
 		GOTO(out_stats, err);
 
-	sbi->ll_ra_stats = lprocfs_alloc_stats(ARRAY_SIZE(ra_stat_string),
-					       LPROCFS_STATS_FLAG_NONE);
-	if (sbi->ll_ra_stats == NULL)
-		GOTO(out_stats, err = -ENOMEM);
-
-	for (id = 0; id < ARRAY_SIZE(ra_stat_string); id++)
-		lprocfs_counter_init(sbi->ll_ra_stats, id, 0,
-				     ra_stat_string[id], "pages");
-	err = lprocfs_register_stats(sbi->ll_proc_root, "read_ahead_stats",
-				     sbi->ll_ra_stats);
-	if (err)
-		GOTO(out_ra_stats, err);
-
 	err = lprocfs_add_vars(sbi->ll_proc_root, lprocfs_llite_obd_vars, sb);
 	if (err)
-		GOTO(out_ra_stats, err);
+		GOTO(out_stats, err);
 
 	/* Yes we also register sysfs mount kset here as well */
 	sbi->ll_kset.kobj.parent = llite_kobj;
@@ -1433,17 +1406,15 @@ int ll_debugfs_register_super(struct super_block *sb, const char *name)
 	init_completion(&sbi->ll_kobj_unregister);
 	err = kobject_set_name(&sbi->ll_kset.kobj, "%s", name);
 	if (err)
-		GOTO(out_ra_stats, err);
+		GOTO(out_stats, err);
 
 	err = kset_register(&sbi->ll_kset);
 	if (err)
-		GOTO(out_ra_stats, err);
+		GOTO(out_stats, err);
 
 	lsi->lsi_kobj = kobject_get(&sbi->ll_kset.kobj);
 
 	RETURN(0);
-out_ra_stats:
-	lprocfs_free_stats(&sbi->ll_ra_stats);
 out_stats:
 	lprocfs_free_stats(&sbi->ll_stats);
 out_proc:
@@ -1495,7 +1466,6 @@ int lprocfs_ll_register_obd(struct super_block *sb, const char *obdname)
 out:
 	if (err) {
 		lprocfs_remove(&sbi->ll_proc_root);
-		lprocfs_free_stats(&sbi->ll_ra_stats);
 		lprocfs_free_stats(&sbi->ll_stats);
 	}
 	RETURN(err);
@@ -1513,7 +1483,6 @@ void ll_debugfs_unregister_super(struct super_block *sb)
 
         if (sbi->ll_proc_root) {
                 lprocfs_remove(&sbi->ll_proc_root);
-                lprocfs_free_stats(&sbi->ll_ra_stats);
                 lprocfs_free_stats(&sbi->ll_stats);
         }
 }

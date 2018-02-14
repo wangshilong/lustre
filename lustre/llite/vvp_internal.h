@@ -89,12 +89,13 @@ struct vvp_io {
 			bool			 ft_flags_valid;
 		} fault;
 		struct {
-			struct pipe_inode_info	*vui_pipe;
-			unsigned int		 vui_flags;
-		} splice;
+			struct cl_page_list	 vui_plist;
+			struct pipe_inode_info	*vui_splice_pipe;
+			unsigned int		 vui_splice_flags;
+		} read;
 		struct {
-			struct cl_page_list vui_queue;
-			unsigned long vui_written;
+			struct cl_page_list vui_plist;
+			size_t vui_written;
 			int vui_from;
 			int vui_to;
 		} write;
@@ -110,12 +111,6 @@ struct vvp_io {
 	* File descriptor against which IO is done.
 	*/
 	struct ll_file_data	*vui_fd;
-
-	/* Readahead state. */
-	pgoff_t	vui_ra_start;
-	pgoff_t	vui_ra_count;
-	/* Set when vui_ra_{start,count} have been initialized. */
-	bool		vui_ra_valid;
 };
 
 extern struct lu_device_type vvp_device_type;
@@ -227,12 +222,8 @@ struct vvp_object {
  * VVP-private page state.
  */
 struct vvp_page {
-	struct cl_page_slice vpg_cl;
-	unsigned	vpg_defer_uptodate:1,
-			vpg_ra_updated:1,
-			vpg_ra_used:1;
-	/** VM page */
-	struct page	*vpg_page;
+	struct cl_page_slice	 vpg_cl;
+	struct page		*vpg_page;	/** << VM page */
 };
 
 static inline struct vvp_page *cl2vvp_page(const struct cl_page_slice *slice)
@@ -306,6 +297,8 @@ int lov_read_and_clear_async_rc(struct cl_object *clob);
 
 int vvp_io_init(const struct lu_env *env, struct cl_object *obj,
 		struct cl_io *io);
+int vvp_io_read_commit(const struct lu_env *env, struct cl_io *io,
+		       struct cl_page_list *plist);
 int vvp_io_write_commit(const struct lu_env *env, struct cl_io *io);
 int vvp_page_init(const struct lu_env *env, struct cl_object *obj,
 		  struct cl_page *page, pgoff_t index);

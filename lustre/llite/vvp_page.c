@@ -138,14 +138,10 @@ static void vvp_page_discard(const struct lu_env *env,
 			     const struct cl_page_slice *slice,
 			     struct cl_io *unused)
 {
-	struct page     *vmpage = cl2vm_page(slice);
-	struct vvp_page *vpg    = cl2vvp_page(slice);
+	struct page *vmpage = cl2vm_page(slice);
 
 	LASSERT(vmpage != NULL);
 	LASSERT(PageLocked(vmpage));
-
-	if (vpg->vpg_defer_uptodate && !vpg->vpg_ra_used)
-		ll_ra_stats_inc(vmpage->mapping->host, RA_STAT_DISCARDED);
 
 	ll_invalidate_page(vmpage);
 }
@@ -257,27 +253,13 @@ static void vvp_page_completion_read(const struct lu_env *env,
 	struct vvp_page *vpg    = cl2vvp_page(slice);
 	struct page     *vmpage = vpg->vpg_page;
 	struct cl_page  *page   = slice->cpl_page;
-	struct inode    *inode  = vvp_object_inode(page->cp_obj);
 	ENTRY;
 
 	LASSERT(PageLocked(vmpage));
 	CL_PAGE_HEADER(D_PAGE, env, page, "completing READ with %d\n", ioret);
 
-	if (vpg->vpg_defer_uptodate)
-		ll_ra_count_put(ll_i2sbi(inode), 1);
-
-	if (ioret == 0)  {
-		if (!vpg->vpg_defer_uptodate)
-			cl_page_export(env, page, 1);
-	} else if (vpg->vpg_defer_uptodate) {
-		vpg->vpg_defer_uptodate = 0;
-		if (ioret == -EWOULDBLOCK) {
-			/* mirror read failed, it needs to destroy the page
-			 * because subpage would be from wrong osc when trying
-			 * to read from a new mirror */
-			ll_invalidate_page(vmpage);
-		}
-	}
+	if (ioret == 0)
+		cl_page_export(env, page, 1);
 
 	if (page->cp_sync_io == NULL)
 		unlock_page(vmpage);
@@ -360,9 +342,7 @@ static int vvp_page_print(const struct lu_env *env,
 	struct vvp_page *vpg	= cl2vvp_page(slice);
 	struct page     *vmpage	= vpg->vpg_page;
 
-	(*printer)(env, cookie, LUSTRE_VVP_NAME"-page@%p(%d:%d) "
-		   "vm@%p ",
-		   vpg, vpg->vpg_defer_uptodate, vpg->vpg_ra_used, vmpage);
+	(*printer)(env, cookie, LUSTRE_VVP_NAME"-page@%p vm@%p ", vpg, vmpage);
 
 	if (vmpage != NULL) {
 		(*printer)(env, cookie, "%lx %d:%d %lx %lu %slru",

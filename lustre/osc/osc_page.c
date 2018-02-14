@@ -792,7 +792,9 @@ out:
 static int osc_lru_alloc(const struct lu_env *env, struct client_obd *cli,
 			 struct osc_page *opg)
 {
-	struct l_wait_info lwi = LWI_INTR(LWI_ON_SIGNAL_NOOP, NULL);
+	struct l_wait_info lwi = LWI_TIMEOUT_INTR(
+					cfs_time_seconds(LRU_ALLOC_TIMEOUT),
+					NULL, LWI_ON_SIGNAL_NOOP, NULL);
 	struct osc_io *oio = osc_env_io(env);
 	int rc = 0;
 
@@ -817,8 +819,12 @@ static int osc_lru_alloc(const struct lu_env *env, struct client_obd *cli,
 
 		cond_resched();
 		rc = l_wait_event(osc_lru_waitq,
-				atomic_long_read(cli->cl_lru_left) > 0,
-				&lwi);
+				  atomic_long_read(cli->cl_lru_left) > 0, &lwi);
+		if (rc == -ETIMEDOUT) {
+			CDEBUG(D_CACHE, "timeout of LRU alloc\n");
+			rc = 0; /* success with delay to avoid deadlock */
+			break;
+		}
 		if (rc < 0)
 			break;
 	}

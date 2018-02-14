@@ -323,50 +323,10 @@ static inline struct ll_inode_info *ll_i2info(struct inode *inode)
 /* default to read-ahead full files smaller than 2MB on the second read */
 #define SBI_DEFAULT_READAHEAD_WHOLE_MAX	(2UL << (20 - PAGE_SHIFT))
 
-enum ra_stat {
-        RA_STAT_HIT = 0,
-        RA_STAT_MISS,
-        RA_STAT_DISTANT_READPAGE,
-        RA_STAT_MISS_IN_WINDOW,
-        RA_STAT_FAILED_GRAB_PAGE,
-        RA_STAT_FAILED_MATCH,
-        RA_STAT_DISCARDED,
-        RA_STAT_ZERO_LEN,
-        RA_STAT_ZERO_WINDOW,
-        RA_STAT_EOF,
-        RA_STAT_MAX_IN_FLIGHT,
-        RA_STAT_WRONG_GRAB_PAGE,
-	RA_STAT_FAILED_REACH_END,
-	_NR_RA_STAT,
-};
-
 struct ll_ra_info {
-	atomic_t	ra_cur_pages;
 	unsigned long	ra_max_pages;
 	unsigned long	ra_max_pages_per_file;
 	unsigned long	ra_max_read_ahead_whole_pages;
-};
-
-/* ra_io_arg will be filled in the beginning of ll_readahead with
- * ras_lock, then the following ll_read_ahead_pages will read RA
- * pages according to this arg, all the items in this structure are
- * counted by page index.
- */
-struct ra_io_arg {
-	unsigned long ria_start;  /* start offset of read-ahead*/
-	unsigned long ria_end;    /* end offset of read-ahead*/
-	unsigned long ria_reserved; /* reserved pages for read-ahead */
-	unsigned long ria_end_min;  /* minimum end to cover current read */
-	bool          ria_eof;    /* reach end of file */
-	/* If stride read pattern is detected, ria_stoff means where
-	 * stride read is started. Note: for normal read-ahead, the
-	 * value here is meaningless, and also it will not be accessed*/
-	pgoff_t ria_stoff;
-	/* ria_length and ria_pages are the length and pages length in the
-	 * stride I/O mode. And they will also be used to check whether
-	 * it is stride I/O read-ahead in the read-ahead pages*/
-	unsigned long ria_length;
-	unsigned long ria_pages;
 };
 
 /* LL_HIST_MAX=32 causes an overflow */
@@ -504,8 +464,6 @@ struct ll_sb_info {
 	 * but is uncommitted to stable storage. */
 	struct cl_client_cache	 *ll_cache;
 
-        struct lprocfs_stats     *ll_ra_stats;
-
         struct ll_ra_info         ll_ra_info;
         unsigned int              ll_namelen;
         struct file_operations   *ll_fop;
@@ -552,85 +510,45 @@ struct ll_sb_info {
  * per file-descriptor read-ahead data.
  */
 struct ll_readahead_state {
-	spinlock_t  ras_lock;
-        /*
-         * index of the last page that read(2) needed and that wasn't in the
-         * cache. Used by ras_update() to detect seeks.
-         *
-         * XXX nikita: if access seeks into cached region, Lustre doesn't see
-         * this.
-         */
-        unsigned long   ras_last_readpage;
-        /*
-         * number of pages read after last read-ahead window reset. As window
-         * is reset on each seek, this is effectively a number of consecutive
-         * accesses. Maybe ->ras_accessed_in_window is better name.
-         *
-         * XXX nikita: window is also reset (by ras_update()) when Lustre
-         * believes that memory pressure evicts read-ahead pages. In that
-         * case, it probably doesn't make sense to expand window to
-         * PTLRPC_MAX_BRW_PAGES on the third access.
-         */
-        unsigned long   ras_consecutive_pages;
-        /*
-         * number of read requests after the last read-ahead window reset
-         * As window is reset on each seek, this is effectively the number
-         * on consecutive read request and is used to trigger read-ahead.
-         */
-        unsigned long   ras_consecutive_requests;
-        /*
-         * Parameters of current read-ahead window. Handled by
-         * ras_update(). On the initial access to the file or after a seek,
-         * window is reset to 0. After 3 consecutive accesses, window is
-         * expanded to PTLRPC_MAX_BRW_PAGES. Afterwards, window is enlarged by
-         * PTLRPC_MAX_BRW_PAGES chunks up to ->ra_max_pages.
-         */
-        unsigned long   ras_window_start, ras_window_len;
+	spinlock_t	ras_lock;
 	/*
-	 * Optimal RPC size. It decides how many pages will be sent
-	 * for each read-ahead.
+	 * index of the last page that read(2) needed.
+	 * Used by ras_update() to detect seeks.
 	 */
-	unsigned long	ras_rpc_size;
-        /*
-         * Where next read-ahead should start at. This lies within read-ahead
-         * window. Read-ahead window is read in pieces rather than at once
-         * because: 1. lustre limits total number of pages under read-ahead by
-         * ->ra_max_pages (see ll_ra_count_get()), 2. client cannot read pages
-         * not covered by DLM lock.
-         */
-        unsigned long   ras_next_readahead;
-        /*
-         * Total number of ll_file_read requests issued, reads originating
-         * due to mmap are not counted in this total.  This value is used to
-         * trigger full file read-ahead after multiple reads to a small file.
-         */
-        unsigned long   ras_requests;
-        /*
-         * Page index with respect to the current request, these value
-         * will not be accurate when dealing with reads issued via mmap.
-         */
-        unsigned long   ras_request_index;
-        /*
-         * The following 3 items are used for detecting the stride I/O
-         * mode.
-         * In stride I/O mode,
-         * ...............|-----data-----|****gap*****|--------|******|....
-         *    offset      |-stride_pages-|-stride_gap-|
-         * ras_stride_offset = offset;
-         * ras_stride_length = stride_pages + stride_gap;
-         * ras_stride_pages = stride_pages;
-         * Note: all these three items are counted by pages.
-         */
-        unsigned long   ras_stride_length;
-        unsigned long   ras_stride_pages;
-        pgoff_t         ras_stride_offset;
-        /*
-         * number of consecutive stride request count, and it is similar as
-         * ras_consecutive_requests, but used for stride I/O mode.
-         * Note: only more than 2 consecutive stride request are detected,
-         * stride read-ahead will be enable
-         */
-        unsigned long   ras_consecutive_stride_requests;
+	unsigned long	ras_last_readpage;
+	/*
+	 * number of pages read at once.
+	 */
+	unsigned long	ras_consecutive_pages;
+	/*
+	 * Where next read-ahead should start at.
+	 */
+	unsigned long	ras_next_readahead;
+	/*
+	 * number of pages in current read ahead window.
+	 */
+	unsigned long	ras_window_size;
+	/*
+	 * The following 3 items are used for detecting the stride I/O
+	 * mode.
+	 * In stride I/O mode,
+	 * ...............|-----data-----|****gap*****|--------|******|....
+	 *    offset      |-stride_pages-|-stride_gap-|
+	 * ras_stride_offset = offset;
+	 * ras_stride_length = stride_pages + stride_gap;
+	 * ras_stride_pages = stride_pages;
+	 * Note: all these three items are counted by pages.
+	 */
+	unsigned long	ras_stride_length;
+	unsigned long	ras_stride_pages;
+	pgoff_t		ras_stride_offset;
+	/*
+	 * number of consecutive stride request count, and it is similar as
+	 * ras_consecutive_requests, but used for stride I/O mode.
+	 * Note: only more than 2 consecutive stride request are detected,
+	 * stride read-ahead will be enable
+	 */
+	unsigned long	ras_consecutive_stride_requests;
 };
 
 extern struct kmem_cache *ll_file_data_slab;
@@ -705,8 +623,6 @@ static inline bool ll_sbi_has_tiny_write(struct ll_sb_info *sbi)
 {
 	return !!(sbi->ll_flags & LL_SBI_TINY_WRITE);
 }
-
-void ll_ras_enter(struct file *f);
 
 /* llite/lcommon_misc.c */
 int cl_ocd_update(struct obd_device *host, struct obd_device *watched,
@@ -811,14 +727,12 @@ void ll_update_times(struct ptlrpc_request *request, struct inode *inode);
 int ll_writepage(struct page *page, struct writeback_control *wbc);
 int ll_writepages(struct address_space *, struct writeback_control *wbc);
 int ll_readpage(struct file *file, struct page *page);
-int ll_io_read_page(const struct lu_env *env, struct cl_io *io,
-			   struct cl_page *page, struct file *file);
-void ll_readahead_init(struct inode *inode, struct ll_readahead_state *ras);
-int vvp_io_write_commit(const struct lu_env *env, struct cl_io *io);
+int ll_readpages(struct file *file, struct address_space *mapping,
+		 struct list_head *pages, unsigned int nr_pages);
+void ll_ras_init(struct ll_readahead_state *ras);
+void ll_ras_update(struct file *f, unsigned long index, unsigned long pages);
 
-enum lcc_type;
-void ll_cl_add(struct file *file, const struct lu_env *env, struct cl_io *io,
-	       enum lcc_type type);
+void ll_cl_add(struct file *file, const struct lu_env *env, struct cl_io *io);
 void ll_cl_remove(struct file *file, const struct lu_env *env);
 struct ll_cl_context *ll_cl_find(struct file *file);
 
@@ -898,6 +812,7 @@ int ll_fid2path(struct inode *inode, void __user *arg);
 int ll_data_version(struct inode *inode, __u64 *data_version, int flags);
 int ll_hsm_release(struct inode *inode);
 int ll_hsm_state_set(struct inode *inode, struct hsm_state_set *hss);
+void ll_io_init(struct cl_io *io, struct file *file, enum cl_io_type iot);
 void ll_io_set_mirror(struct cl_io *io, const struct file *file);
 
 /* llite/dcache.c */
@@ -1001,6 +916,8 @@ int ll_dir_get_parent_fid(struct inode *dir, struct lu_fid *parent_fid);
 /* llite/symlink.c */
 extern struct inode_operations ll_fast_symlink_inode_operations;
 
+extern struct cfs_ptask_engine *vvp_ra_engine;
+
 /**
  * IO arguments for various VFS I/O interfaces.
  */
@@ -1020,24 +937,15 @@ struct vvp_io_args {
         } u;
 };
 
-enum lcc_type {
-	LCC_RW = 1,
-	LCC_MMAP
-};
-
 struct ll_cl_context {
 	struct list_head	 lcc_list;
 	void			*lcc_cookie;
 	const struct lu_env	*lcc_env;
 	struct cl_io		*lcc_io;
 	struct cl_page		*lcc_page;
-	enum lcc_type		 lcc_type;
 };
 
 struct ll_thread_info {
-	struct iov_iter		lti_iter;
-	struct vvp_io_args	lti_args;
-	struct ra_io_arg	lti_ria;
 	struct ll_cl_context	lti_io_ctx;
 };
 
@@ -1051,16 +959,6 @@ static inline struct ll_thread_info *ll_env_info(const struct lu_env *env)
 	LASSERT(lti != NULL);
 
 	return lti;
-}
-
-static inline struct vvp_io_args *ll_env_args(const struct lu_env *env,
-					      enum vvp_io_subtype type)
-{
-	struct vvp_io_args *via = &ll_env_info(env)->lti_args;
-
-	via->via_io_subtype = type;
-
-	return via;
 }
 
 /* llite/llite_mmap.c */
@@ -1168,13 +1066,6 @@ const struct xattr_handler *get_xattr_type(const char *name);
  */
 int cl_sb_init(struct super_block *sb);
 int cl_sb_fini(struct super_block *sb);
-
-enum ras_update_flags {
-	LL_RAS_HIT  = 0x1,
-	LL_RAS_MMAP = 0x2
-};
-void ll_ra_count_put(struct ll_sb_info *sbi, unsigned long len);
-void ll_ra_stats_inc(struct inode *inode, enum ra_stat which);
 
 /* statahead.c */
 
@@ -1446,9 +1337,6 @@ int ll_layout_write_intent(struct inode *inode, enum layout_intent_opc opc,
 
 int ll_xattr_init(void);
 void ll_xattr_fini(void);
-
-int ll_page_sync_io(const struct lu_env *env, struct cl_io *io,
-		    struct cl_page *page, enum cl_req_type crt);
 
 int ll_getparent(struct file *file, struct getparent __user *arg);
 
