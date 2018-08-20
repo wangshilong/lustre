@@ -375,9 +375,11 @@ int ll_readpage(struct file *file, struct page *vmpage)
 	int rc = 0;
 	ENTRY;
 
+	/*
 	rc = lustre_readpage_from_fscache(inode, vmpage);
 	if (rc == 0)
 		return rc;
+	*/
 
 	lcc = ll_cl_find(file);
 	if (lcc == NULL || lcc->lcc_io == NULL)
@@ -685,6 +687,7 @@ next_chunk:
 				ClearPageReadahead(vmpage);
 				ra_set = true;
 			}
+			ClearPageFsCache(vmpage);
 			put_page(vmpage);
 			vmpage = NULL;
 			goto check_for_more;
@@ -910,6 +913,12 @@ static int ll_readpages_ptask(struct cfs_ptask *ptask)
 	nr_submit_pages = ll_readpages_submit(file, mapping, &pt->lrp_pages,
 					      pt->lrp_chunk_size,
 					      ptask->pt_cbcpu);
+	if (nr_submit_pages > 0) {
+		rc = lustre_readpages_from_fscache(file_inode(file), mapping,
+					   &chunk_pages, (unsigned int *)&nr_submit_pages);
+		if (rc == 0)
+			GOTO(out_io, rc);
+	}
 
 	if (nr_submit_pages > 0)
 		CDEBUG(D_READA, "%s: submit %ld pages to other thread\n",
@@ -1057,6 +1066,11 @@ int ll_readpages(struct file *file, struct address_space *mapping,
 				file_dentry(file)->d_name.name,
 				nr_submit_pages, nr_pages);
 	}
+
+	rc = lustre_readpages_from_fscache(inode, mapping, &chunk_pages,
+					   (unsigned int *)&nr_chunk_pages);
+	if (rc == 0)
+		GOTO(out, rc);
 
 	if (nr_chunk_pages > 0) {
 		struct cl_page_list *plist = &vvp_env_io(env)->u.read.vui_plist;

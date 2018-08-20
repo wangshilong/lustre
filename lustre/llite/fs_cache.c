@@ -283,6 +283,35 @@ int __lustre_readpage_from_fscache(struct inode *inode, struct page *page)
 	}
 }
 
+int lustre_readpages_from_fscache(struct inode *inode,
+				  struct address_space *mapping,
+				  struct list_head *pages,
+				  unsigned *nr_pages)
+{
+	int ret;
+	struct ll_inode_info *ll_info = ll_i2info(inode);
+
+	if (!ll_info->fscache)
+		return -ENOBUFS;
+
+	ret = fscache_read_or_alloc_pages(ll_info->fscache,
+					  mapping, pages, nr_pages,
+					  lustre_vfs_readpage_complete,
+					  NULL,
+					  mapping_gfp_mask(mapping));
+	switch (ret) {
+	case -ENOBUFS:
+	case -ENODATA:
+		return 1;
+	case 0:
+		BUG_ON(!list_empty(pages));
+		BUG_ON(*nr_pages != 0);
+		return ret;
+	default:
+		return ret;
+	}
+}
+
 /**
  * __lustre_readpage_to_fscache - write a page to the cache
  *
