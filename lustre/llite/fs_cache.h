@@ -53,6 +53,10 @@ extern int __lustre_fscache_release_page(struct page *page, gfp_t gfp);
 extern void __lustre_fscache_invalidate_page(struct page *page);
 extern int __lustre_readpage_from_fscache(struct inode *inode,
 					struct page *page);
+extern int lustre_readpages_from_fscache(struct inode *inode,
+				       struct address_space *mapping,
+				       struct list_head *pages,
+				       unsigned *nr_pages);
 extern void __lustre_readpage_to_fscache(struct inode *inode, struct page *page);
 extern void __lustre_fscache_wait_on_page_write(struct inode *inode,
 					      struct page *page);
@@ -78,7 +82,7 @@ static inline void lustre_readpage_to_fscache(struct inode *inode,
 					    struct page *page)
 {
 	/* readahead thread might make us to skip mark it cached */
-	SetPageFsCache(page);
+	//SetPageFsCache(page);
 
 	if (PageFsCache(page))
 		__lustre_readpage_to_fscache(inode, page);
