@@ -1931,6 +1931,7 @@ struct cl_io {
 	 * Range of write intent. Valid if ci_need_write_intent is set.
 	 */
 	struct lu_extent	ci_write_intent;
+	bool			ci_invalidate_fscache;
 };
 
 /** @} cl_io */
