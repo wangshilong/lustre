@@ -138,14 +138,16 @@ static void vvp_page_disown(const struct lu_env *env,
 
 static void vvp_page_discard(const struct lu_env *env,
 			     const struct cl_page_slice *slice,
-			     struct cl_io *unused)
+			     struct cl_io *io)
 {
 	struct page *vmpage = cl2vm_page(slice);
 
 	LASSERT(vmpage != NULL);
 	LASSERT(PageLocked(vmpage));
 
-	lustre_fscache_invalidate_page(vmpage);
+	/* only uncache upon write conflict */
+	if (io->ci_invalidate_fscache)
+		lustre_fscache_invalidate_page(vmpage);
 	ll_invalidate_page(vmpage);
 }
 

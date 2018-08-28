@@ -397,6 +397,7 @@ static int osc_dlm_blocking_ast0(const struct lu_env *env,
 	int			result = 0;
 	bool			discard;
 	enum cl_lock_mode	mode = CLM_READ;
+	struct cl_io *io = osc_env_thread_io(env);
 	ENTRY;
 
 	LASSERT(flag == LDLM_CB_CANCELING);
@@ -428,11 +429,13 @@ static int osc_dlm_blocking_ast0(const struct lu_env *env,
 		struct cl_attr *attr = &osc_env_info(env)->oti_attr;
 		__u64 old_kms;
 
+		io->ci_invalidate_fscache = true;
 		/* Destroy pages covered by the extent of the DLM lock */
 		result = osc_lock_flush(cl2osc(obj),
 					cl_index(obj, extent->start),
 					cl_index(obj, extent->end),
 					mode, discard);
+		io->ci_invalidate_fscache = false;
 
 		/* losing a lock, update kms */
 		lock_res_and_lock(dlmlock);
